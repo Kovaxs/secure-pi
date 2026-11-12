@@ -22,7 +22,7 @@ This is a **speed bump, not a security boundary**:
 Symlink into Pi's global extensions directory:
 
 ```bash
-ln -s ~/workspace/securepi/securepi.ts ~/.pi/agent/extensions/securepi.ts
+pi install git:github.com/kovaxs/secure-pi
 ```
 
 Then run `/reload` in Pi, or restart it.
