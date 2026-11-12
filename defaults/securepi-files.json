@@ -1,0 +1,12 @@
+[
+  "**/auth.json",
+  "**/mcp-auth.json",
+  "**/trust.json",
+  "**/.password-store",
+  "**/.gnupg",
+  "**/models.json",
+  "**/.env",
+  "**/.env.*",
+  "**/securepi-blacklist.json",
+  "**/securepi-cli.json"
+]
