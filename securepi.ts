@@ -9,6 +9,10 @@
  * defaults until the list file is first written. Manage them with /securepi.
  * Every change to a list asks for approval.
  *
+ * Bash commands are parsed the way a shell would read them: quotes, escapes,
+ * brace expansion, $HOME, cd, wrappers (timeout, sudo, ...), sh -c, eval, and
+ * find -exec. A command with a shell variable that cannot be resolved always asks.
+ *
  * This is a speed bump, not a sandbox: commands can be obfuscated, and any
  * extension or process running as your user can bypass it.
  */
@@ -49,9 +53,9 @@ interface LoadResult {
 }
 
 interface Reason {
-	kind: "file" | "cli";
+	kind: "file" | "cli" | "unresolved";
 	subject: string;
-	entry: string;
+	detail: string; // shown in the approval dialog
 	command?: string;
 }
 
@@ -73,10 +77,20 @@ const CLI: Store = {
 const WRITE_TOOLS = new Set(["write", "edit"]);
 const PATH_TOOLS = new Set(["read", "write", "edit", "grep", "find", "ls"]);
 
-// Command separators used to split a bash command into segments.
-const SEGMENT_SPLIT = /&&|\|\||[;|&\n(){}`]/;
-// Prefixes that run another program; the program name follows them.
-const WRAPPERS = new Set(["sudo", "doas", "env", "command", "exec", "nohup", "time", "nice", "xargs"]);
+// Bash parsing tables. These describe how commands are read, not what is restricted.
+const WRAPPERS = new Set([
+	"sudo", "doas", "env", "command", "exec", "builtin", "nohup", "time", "nice",
+	"timeout", "stdbuf", "xargs", "caffeinate", "watch", "busybox",
+]);
+const SHELLS = new Set(["sh", "bash", "zsh", "dash", "ksh", "fish"]);
+const SHELL_C = /^-[A-Za-z]*c[A-Za-z]*$/;
+const INTERPRETERS = new Set([
+	"python", "python2", "python3", "perl", "ruby", "node", "deno", "bun", "php", "lua", "osascript", "pwsh", "powershell",
+]);
+const INLINE_FLAGS = new Set(["-c", "-e", "-E", "--eval", "--print"]);
+const EXEC_FLAGS = new Set(["-exec", "-execdir", "-ok", "-okdir"]);
+const COPY_OR_LOCATE = new Set(["cp", "mv", "ln", "install", "rsync", "scp", "which", "whereis", "type"]);
+const MAX_NESTING = 4;
 
 type GlobSync = (pattern: string, opts: { cwd: string }) => string[];
 const globSync = (fs as unknown as { globSync?: GlobSync }).globSync;
@@ -121,9 +135,19 @@ function globToRegExp(glob: string): RegExp {
 	return new RegExp(`^${re}$`);
 }
 
+const regexCache = new Map<string, RegExp>();
+function cachedGlob(glob: string): RegExp {
+	let re = regexCache.get(glob);
+	if (!re) {
+		re = globToRegExp(glob);
+		regexCache.set(glob, re);
+	}
+	return re;
+}
+
 // A path matches an entry if the path or any of its parent directories matches.
 function matchesFileEntry(entry: string, abs: string): boolean {
-	const re = globToRegExp(entry);
+	const re = cachedGlob(entry);
 	let p = abs;
 	for (;;) {
 		if (re.test(p)) return true;
@@ -176,8 +200,7 @@ function normalizeCli(raw: string): string {
 	return name;
 }
 
-// ---------- bash parsing ----------
-
+// Splits a /securepi argument line into words, honouring quotes.
 function tokenize(text: string): string[] {
 	const out: string[] = [];
 	const re = /"([^"]*)"|'([^']*)'|(\S+)/g;
@@ -187,56 +210,315 @@ function tokenize(text: string): string[] {
 	return out;
 }
 
-// Program names that a command runs, one per segment.
-function programs(command: string): string[] {
-	const names: string[] = [];
-	for (const segment of command.split(SEGMENT_SPLIT)) {
-		const tokens = tokenize(segment);
-		let i = 0;
-		while (
-			i < tokens.length &&
-			(/^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[i]) || WRAPPERS.has(basename(tokens[i])) || tokens[i].startsWith("-"))
-		) {
-			i++;
+// ---------- bash parsing ----------
+
+interface Word {
+	text: string; // after quote and escape removal, with $HOME expanded
+	dynamic: boolean; // contains a shell variable that is not known
+}
+
+interface Parsed {
+	segments: Word[][];
+	substitution: boolean; // $(...) or backticks present
+}
+
+// Reads a shell command the way a shell would split and unquote it.
+// Segments are separated by ; & | ( ) newlines and command substitutions.
+function parseShell(src: string): Parsed {
+	const segments: Word[][] = [];
+	let words: Word[] = [];
+	let text = "";
+	let inWord = false;
+	let dynamic = false;
+	let substitution = false;
+	let subDepth = 0;
+	let quote: "'" | '"' | null = null;
+
+	const endWord = () => {
+		if (inWord) words.push({ text, dynamic });
+		text = "";
+		inWord = false;
+		dynamic = false;
+	};
+	const endSegment = () => {
+		endWord();
+		if (words.length) segments.push(words);
+		words = [];
+	};
+	// src[i] is "$". Reads $NAME or ${NAME}; returns the index after it.
+	const readDollar = (i: number): number => {
+		const rest = src.slice(i + 1);
+		let name: string;
+		let len: number;
+		if (rest.startsWith("{")) {
+			const end = rest.indexOf("}");
+			if (end < 0) {
+				text += "$";
+				inWord = true;
+				return i + 1;
+			}
+			name = rest.slice(1, end);
+			len = end + 1;
+		} else {
+			const m = /^(?:[A-Za-z_][A-Za-z0-9_]*|[0-9@*#?$!-])/.exec(rest);
+			if (!m) {
+				text += "$";
+				inWord = true;
+				return i + 1;
+			}
+			name = m[0];
+			len = m[0].length;
 		}
-		if (i < tokens.length) names.push(tokens[i]);
+		inWord = true;
+		if (name === "HOME") {
+			text += homedir();
+		} else {
+			dynamic = true;
+			text += `$${name}`;
+		}
+		return i + 1 + len;
+	};
+
+	let i = 0;
+	while (i < src.length) {
+		const c = src[i];
+		const next = src[i + 1] ?? "";
+
+		if (quote === "'") {
+			if (c === "'") quote = null;
+			else text += c;
+			i++;
+			continue;
+		}
+		if (c === "\\") {
+			if (quote === '"' && !'$`"\\\n'.includes(next)) {
+				text += c;
+				inWord = true;
+				i++;
+				continue;
+			}
+			if (next !== "\n") {
+				text += next;
+				inWord = true;
+			}
+			i += 2;
+			continue;
+		}
+		if (c === "$" && next === "(") {
+			substitution = true;
+			subDepth++;
+			endSegment();
+			i += 2;
+			continue;
+		}
+		if (c === "`") {
+			substitution = true;
+			endSegment();
+			i++;
+			continue;
+		}
+		if (c === ")" && subDepth > 0) {
+			subDepth--;
+			endSegment();
+			i++;
+			continue;
+		}
+		if (quote === '"') {
+			if (c === '"') {
+				quote = null;
+				inWord = true;
+				i++;
+			} else if (c === "$") {
+				i = readDollar(i);
+			} else {
+				text += c;
+				inWord = true;
+				i++;
+			}
+			continue;
+		}
+
+		// unquoted
+		if (c === " " || c === "\t" || c === "\r") {
+			endWord();
+			i++;
+			continue;
+		}
+		if (c === "\n" || c === ";" || c === "&" || c === "|" || c === "(" || c === ")") {
+			endSegment();
+			i++;
+			continue;
+		}
+		if (c === "'") {
+			quote = "'";
+			inWord = true;
+			i++;
+			continue;
+		}
+		if (c === '"') {
+			quote = '"';
+			inWord = true;
+			i++;
+			continue;
+		}
+		if (c === "$") {
+			i = readDollar(i);
+			continue;
+		}
+		if (c === "#" && !inWord) {
+			const nl = src.indexOf("\n", i);
+			if (nl < 0) break;
+			i = nl;
+			continue;
+		}
+		text += c;
+		inWord = true;
+		i++;
 	}
-	return names;
+	endSegment();
+	return { segments, substitution };
+}
+
+// Brace expansion for one level: a{b,c}d -> abd, acd. Capped to keep it cheap.
+function braceExpand(word: string): string[] {
+	const m = /\{([^{}]*,[^{}]*)\}/.exec(word);
+	if (!m) return [word];
+	const before = word.slice(0, m.index);
+	const after = word.slice(m.index + m[0].length);
+	return m[1]
+		.split(",")
+		.flatMap((alt) => braceExpand(before + alt + after))
+		.slice(0, 64);
+}
+
+// Absolute paths a word may name, resolved against each base directory.
+// Wildcards are expanded against the filesystem when fs.globSync exists.
+function wordCandidates(word: string, bases: string[]): string[] {
+	const out: string[] = [];
+	for (const variant of braceExpand(word)) {
+		const parts = [variant];
+		const eq = variant.indexOf("=");
+		if (eq >= 0) parts.push(variant.slice(eq + 1));
+		for (const part of parts) {
+			if (!part) continue;
+			const p = expandHome(part);
+			for (const base of bases) {
+				out.push(resolve(base, p));
+				if (/[*?[]/.test(p) && globSync) {
+					try {
+						for (const hit of globSync(p, { cwd: base })) out.push(resolve(base, hit));
+					} catch {
+						// unreadable directory: the literal candidate is still checked
+					}
+				}
+			}
+		}
+	}
+	return out;
+}
+
+// Indexes of the words that run a program: the first real word, plus up to three
+// more after a wrapper such as timeout or sudo, since their options are skipped.
+function commandHeads(words: string[]): number[] {
+	let wrapped = false;
+	let i = 0;
+	for (; i < words.length; i++) {
+		const w = words[i];
+		if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(w) || w.startsWith("-")) continue;
+		if (WRAPPERS.has(basename(w))) {
+			wrapped = true;
+			continue;
+		}
+		break;
+	}
+	if (i >= words.length) return [];
+	const heads = [i];
+	if (wrapped) {
+		for (let k = i + 1; k < words.length && heads.length < 4; k++) {
+			if (!words[k].startsWith("-")) heads.push(k);
+		}
+	}
+	return heads;
 }
 
 function matchCli(prog: string, entries: string[], cwd: string): string | undefined {
 	const name = basename(prog);
 	const full = resolve(cwd, expandHome(prog));
 	return entries.find((e) => {
-		const re = globToRegExp(e);
+		const re = cachedGlob(e);
 		return e.includes("/") ? re.test(prog) || re.test(full) : re.test(name);
 	});
 }
 
-// Absolute paths a bash command may touch. Wildcard tokens are expanded
-// against the filesystem when the runtime supports fs.globSync.
-function bashPathCandidates(command: string, cwd: string): string[] {
-	const found = new Set<string>();
-	for (const segment of command.split(SEGMENT_SPLIT)) {
-		for (const token of tokenize(segment)) {
-			const parts = [token];
-			const eq = token.indexOf("=");
-			if (eq >= 0) parts.push(token.slice(eq + 1));
-			for (const raw of parts) {
-				if (!raw) continue;
-				const pattern = expandHome(raw);
-				if (/[*?[]/.test(pattern) && globSync) {
-					try {
-						for (const hit of globSync(pattern, { cwd })) found.add(resolve(cwd, hit));
-					} catch {
-						// unreadable directory: fall back to the literal pattern
-					}
+// Checks one bash command. Nested shells, eval, and find -exec are checked too.
+function analyzeBash(command: string, cwd: string, cli: string[], files: string[], depth = 0): Reason | undefined {
+	if (depth > MAX_NESTING) return { kind: "unresolved", subject: command, detail: "nested too deeply to check" };
+
+	const { segments, substitution } = parseShell(command);
+	for (const segment of segments) {
+		const dynamic = segment.find((w) => w.dynamic);
+		if (dynamic) return { kind: "unresolved", subject: dynamic.text, detail: "shell variable cannot be resolved" };
+	}
+
+	let simCwd = cwd; // updated by cd, so later relative paths resolve correctly
+	let copyish = substitution;
+	const everyWord: string[] = [];
+
+	for (const segment of segments) {
+		const words = segment.map((w) => w.text);
+		everyWord.push(...words);
+		const heads = commandHeads(words);
+
+		for (const k of heads) {
+			const name = basename(words[k]);
+			const args = words.slice(k + 1);
+			if (COPY_OR_LOCATE.has(name)) copyish = true;
+
+			if (name === "eval") {
+				const r = analyzeBash(args.join(" "), simCwd, cli, files, depth + 1);
+				if (r) return r;
+			} else if (SHELLS.has(name)) {
+				const flag = args.findIndex((w) => SHELL_C.test(w));
+				if (flag >= 0 && flag + 1 < args.length) {
+					const r = analyzeBash(args[flag + 1], simCwd, cli, files, depth + 1);
+					if (r) return r;
 				}
-				found.add(resolve(cwd, pattern));
+			} else if (INTERPRETERS.has(name) && args.some((w) => INLINE_FLAGS.has(w))) {
+				return { kind: "cli", subject: words[k], detail: "runs inline code" };
+			}
+
+			const entry = matchCli(words[k], cli, simCwd);
+			if (entry) return { kind: "cli", subject: words[k], detail: `list entry ${entry}` };
+		}
+
+		for (let k = 0; k + 1 < words.length; k++) {
+			if (EXEC_FLAGS.has(words[k])) {
+				const entry = matchCli(words[k + 1], cli, simCwd);
+				if (entry) return { kind: "cli", subject: words[k + 1], detail: `list entry ${entry}` };
 			}
 		}
+
+		const bases = [...new Set([simCwd, cwd])];
+		for (const w of words) {
+			for (const candidate of wordCandidates(w, bases)) {
+				const entry = matchFile(candidate, files);
+				if (entry) return { kind: "file", subject: candidate, detail: `list entry ${entry}` };
+			}
+		}
+
+		if (heads.length && ["cd", "pushd"].includes(basename(words[heads[0]]))) {
+			simCwd = resolve(simCwd, expandHome(words[heads[0] + 1] ?? "~"));
+		}
 	}
-	return [...found];
+
+	// A copied or located binary keeps its program, so a name match on any word counts.
+	if (copyish) {
+		for (const w of everyWord) {
+			const entry = matchCli(w, cli, cwd);
+			if (entry) return { kind: "cli", subject: w, detail: `copied or located (list entry ${entry})` };
+		}
+	}
+	return undefined;
 }
 
 // ---------- decision ----------
@@ -247,15 +529,8 @@ function findReason(toolName: string, input: Record<string, unknown>, cwd: strin
 	if (toolName === "bash") {
 		const command = String(input.command ?? "");
 		const cli = loadList(CLI).entries;
-		for (const prog of programs(command)) {
-			const entry = matchCli(prog, cli, cwd);
-			if (entry) return { kind: "cli", subject: prog, entry, command };
-		}
-		for (const candidate of bashPathCandidates(command, cwd)) {
-			const entry = matchFile(candidate, files);
-			if (entry) return { kind: "file", subject: candidate, entry, command };
-		}
-		return undefined;
+		const r = analyzeBash(command, cwd, cli, files);
+		return r ? { ...r, command } : undefined;
 	}
 
 	if (!PATH_TOOLS.has(toolName)) return undefined;
@@ -263,7 +538,7 @@ function findReason(toolName: string, input: Record<string, unknown>, cwd: strin
 	if (!path) return undefined;
 	const abs = resolve(cwd, expandHome(path));
 	const entry = matchFile(abs, files);
-	return entry ? { kind: "file", subject: abs, entry } : undefined;
+	return entry ? { kind: "file", subject: abs, detail: `list entry ${entry}` } : undefined;
 }
 
 // ---------- commands ----------
@@ -391,9 +666,11 @@ export default function (pi: ExtensionAPI) {
 		const what =
 			reason.kind === "cli"
 				? `CLI tool ${reason.subject}`
-				: event.toolName === "bash"
-					? "file path in command"
-					: `${event.toolName} path`;
+				: reason.kind === "unresolved"
+					? "bash command with an unresolved shell variable"
+					: event.toolName === "bash"
+						? "file path in command"
+						: `${event.toolName} path`;
 
 		if (!ctx.hasUI) {
 			return { block: true, reason: `securepi: blocked ${what} (no UI to confirm)` };
@@ -401,7 +678,7 @@ export default function (pi: ExtensionAPI) {
 
 		const details = reason.command ? `\n  command: ${reason.command}` : "";
 		const choice = await ctx.ui.select(
-			`🔐 securepi: restricted ${what}\n\n  ${reason.subject}${details}\n  matches list entry: ${reason.entry}\n\nAllow?`,
+			`🔐 securepi: restricted ${what}\n\n  ${reason.subject}${details}\n  ${reason.detail}\n\nAllow?`,
 			WRITE_TOOLS.has(event.toolName) ? ["No"] : ["Yes", "No"],
 		);
 

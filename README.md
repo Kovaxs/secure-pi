@@ -82,7 +82,10 @@ Examples:
 ### CLI tools
 
 - Each command in a pipeline or chain is checked, including commands after `&&`, `||`, `;`, `|`, and inside `$( )`.
-- The program is matched by name, so `pass` matches `/usr/bin/pass` as well as `pass`. Leading `VAR=value` assignments and wrappers like `sudo`, `env`, and `nohup` are skipped.
+- The program is matched by name, so `pass` matches `/usr/bin/pass` as well as `pass`. Leading `VAR=value` assignments and wrappers (`sudo`, `env`, `nohup`, `timeout`, `nice`, `xargs`, and others) are skipped, so `timeout 5 gpg` is checked as `gpg`.
+- `sh -c`, `bash -c`, and `eval` run their text as commands, and that text is checked the same way. `find -exec` checks the program it runs.
+- Interpreters with inline code (`python3 -c`, `node -e`, `perl -e`) always ask, because their code can't be checked here.
+- Copying or locating a restricted binary (`cp`, `mv`, `ln`, `which`, or any `$(...)`) asks when a restricted name appears in the command.
 - An entry with a `/` is matched against the full path instead of the name.
 - Names are glob patterns too: `pinentry*` matches `pinentry-mac`.
 - Text that is only an argument does not count. `echo pass` is not a `pass` call.
@@ -90,7 +93,11 @@ Examples:
 ### Bash paths
 
 - Each argument is resolved against the current directory and checked against the file list. `--file=path` is checked too.
+- Arguments are unquoted the way a shell does it: `'...'`, `"..."`, and backslashes are removed before matching, so `~/.g''nupg` is checked as `~/.gnupg`.
+- `$HOME` and `~` are expanded, and brace alternatives such as `~/.{gnupg,ssh}` are each checked.
+- `cd` and `pushd` change the base for later relative paths, so `cd ~ && cat .gnupg/x` is checked against the real location.
 - Arguments with `*`, `?`, or `[` are expanded against the filesystem before checking, so `cat ~/work/*.json` is checked against the real matching files.
+- A command with any other shell variable (`$FOO`, `$1`, `$?`) always asks, because its paths can't be known. This includes common loops such as `for f in *; do echo "$f"; done`.
 
 ## Approval behavior
 
@@ -111,8 +118,11 @@ If a list file exists but can't be parsed, the defaults apply until the next `ad
 
 This is a **speed bump, not a security boundary**:
 
-- Shell variables, `eval`, subshells that build paths, and encoded commands (`base64`, `python -c`) are not resolved. A command can hide what it touches.
-- Bash path checks use only what appears in the command text. Files reached through symlinks, or paths built at runtime, are not detected.
+- Scripts run from files (`./run.sh`, `python3 script.py`) are not read, and shell aliases and functions are not known.
+- Encoded payloads piped into a shell (`base64 -d | sh`) are not decoded.
+- Content searches (`grep -r`, `find . -exec cat`) can read a restricted file without naming it, so they are not detected. Use the tool-level protections in a sandbox for that.
+- Symlinks are not resolved: a link in an allowed folder that points into a restricted one is not detected.
+- Tools other than the built-in `bash`, `read`, `write`, `edit`, `grep`, `find`, and `ls` are not checked, including MCP and other extensions' tools.
 - Wildcard expansion uses Node's `fs.globSync`. On runtimes without it, wildcard tokens are only matched as literal text.
 - Any extension or process running as your user can read these files directly.
 - For real isolation, run Pi in a sandbox that does not contain the credentials (see Pi's `docs/containerization.md`).
