@@ -5,8 +5,8 @@
  *   - files: glob patterns for files and directories (absolute, or "**" for any depth)
  *   - cli:   program names that need approval when a bash command runs them
  *
- * The lists are the only source of restrictions. Their contents are seeded with
- * defaults until the list file is first written. Manage them with /securepi.
+ * The lists are the only source of restrictions. The first time a list is used it is
+ * seeded from its default file in defaults/. Manage the lists with /securepi.
  * Every change to a list asks for approval.
  *
  * Bash commands are parsed the way a shell would read them: quotes, escapes,
@@ -21,35 +21,25 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import * as fs from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve, sep } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
-// Seed values, used only until the list file is first written.
-const DEFAULT_FILES = [
-	"**/auth.json",
-	"**/mcp-auth.json",
-	"**/trust.json",
-	"**/.password-store",
-	"**/.gnupg",
-	"**/models.json",
-	"**/.env",
-	"**/.env.*",
-	"**/securepi-blacklist.json",
-	"**/securepi-cli.json",
-];
-const DEFAULT_CLI = ["pass", "gpg", "gpg2", "gpgconf", "pinentry*"];
+// Default lists ship as JSON next to this file. realpath follows the symlink that
+// pi may load this file through, so the defaults are found in the repository.
+const DEFAULTS_DIR = join(dirname(fs.realpathSync(fileURLToPath(import.meta.url))), "defaults");
 
 const AGENT_DIR = join(homedir(), ".pi", "agent");
 
 interface Store {
 	title: string;
-	file: string;
-	defaults: string[];
+	file: string; // the list the user edits, in ~/.pi/agent
+	defaultFile: string; // the shipped default it is seeded from
 	normalize: (raw: string, cwd: string) => string; // throws if invalid
 }
 
 interface LoadResult {
 	entries: string[];
-	source: "file" | "default" | "default-corrupt";
+	source: "file" | "corrupt"; // corrupt: the list file is unreadable, so defaults apply
 }
 
 interface Reason {
@@ -62,14 +52,14 @@ interface Reason {
 const FILES: Store = {
 	title: "Files and directories",
 	file: join(AGENT_DIR, "securepi-blacklist.json"),
-	defaults: DEFAULT_FILES,
+	defaultFile: join(DEFAULTS_DIR, "securepi-files.json"),
 	normalize: normalizeFile,
 };
 
 const CLI: Store = {
 	title: "CLI tools",
 	file: join(AGENT_DIR, "securepi-cli.json"),
-	defaults: DEFAULT_CLI,
+	defaultFile: join(DEFAULTS_DIR, "securepi-cli.json"),
 	normalize: (raw) => normalizeCli(raw),
 };
 
@@ -163,17 +153,31 @@ function matchFile(abs: string, entries: string[]): string | undefined {
 
 // ---------- list storage ----------
 
+function isStringArray(data: unknown): data is string[] {
+	return Array.isArray(data) && data.every((x) => typeof x === "string");
+}
+
+// Throws if the shipped default is missing or invalid. Inside a tool_call handler a
+// throw blocks the call, so a broken install fails closed.
+function readDefaults(store: Store): string[] {
+	const data = JSON.parse(readFileSync(store.defaultFile, "utf8"));
+	if (!isStringArray(data)) throw new Error(`securepi: invalid default list ${store.defaultFile}`);
+	return data;
+}
+
 function loadList(store: Store): LoadResult {
-	if (!existsSync(store.file)) return { entries: [...store.defaults], source: "default" };
+	if (!existsSync(store.file)) {
+		const entries = readDefaults(store);
+		saveList(store, entries); // seed the list the user edits
+		return { entries, source: "file" };
+	}
 	try {
 		const data = JSON.parse(readFileSync(store.file, "utf8"));
-		if (Array.isArray(data) && data.every((x) => typeof x === "string")) {
-			return { entries: data, source: "file" };
-		}
+		if (isStringArray(data)) return { entries: data, source: "file" };
 	} catch {
-		// fall through to defaults
+		// fall through to the shipped defaults
 	}
-	return { entries: [...store.defaults], source: "default-corrupt" };
+	return { entries: readDefaults(store), source: "corrupt" };
 }
 
 function saveList(store: Store, entries: string[]): void {
@@ -544,18 +548,13 @@ function findReason(toolName: string, input: Record<string, unknown>, cwd: strin
 // ---------- commands ----------
 
 function formatList(store: Store, result: LoadResult): string {
-	const note =
-		result.source === "default"
-			? " (defaults, no file yet)"
-			: result.source === "default-corrupt"
-				? " (file unreadable, showing defaults)"
-				: "";
+	const note = result.source === "corrupt" ? " (file unreadable, showing shipped defaults)" : "";
 	const body = result.entries.length ? result.entries.map((e) => `  ${e}`).join("\n") : "  (empty)";
 	return `${store.title}${note}:\n${body}`;
 }
 
 function corruptNote(result: LoadResult): string {
-	return result.source === "default-corrupt"
+	return result.source === "corrupt"
 		? "\n\nNote: the existing list file is unreadable. Saving will replace it."
 		: "";
 }
