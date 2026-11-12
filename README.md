@@ -1,43 +1,120 @@
 # securepi
 
-A [Pi](https://pi.dev) extension that asks for confirmation before the agent touches credentials.
+A [Pi](https://pi.dev) extension that asks for confirmation before the agent touches restricted files or runs restricted CLI tools.
 
-It gates:
+Restrictions come from two user-managed lists:
 
-- **Bash commands** that run `pass`, `gpg`, `gpg2`, `gpgconf`, `pinentry*`, or reference `~/.password-store`, `~/.gnupg`, `auth.json`, `mcp-auth.json`, `trust.json`, `~/.pi/agent`, or `.env` files.
-- **Tool paths** for `read`, `write`, `edit`, `grep`, `find`, and `ls` matching the same credential paths.
+- **Files and directories:** paths or glob patterns. Any tool call that touches a match needs approval.
+- **CLI tools:** program names. A bash command that runs one needs approval.
 
-Writes and edits to these paths are always refused. Other matches show a Yes/No prompt. Without interactive UI (print/RPC mode), matches are blocked.
+Nothing is hardcoded in the extension. The lists are seeded with defaults until you change them, and from then on only the list contents apply.
 
-## Custom blacklist
+## Install and update
 
-Add your own paths with the `/securepi` command:
-
-```
-/securepi add ~/clients/acme      # asks for approval before adding
-/securepi list                    # show the blacklist
+```bash
+pi install git:github.com/kovaxs/secure-pi
+pi update --extensions     # pull new versions
 ```
 
-Entries are stored as absolute paths in `~/.pi/agent/securepi-blacklist.json`. Any tool access to a listed path (or anything under it) prompts for confirmation, and writes or edits are refused, just like the built-in credential paths. The model cannot change the list: the file lives under `~/.pi/agent`, which is itself gated.
+Then run `/reload` in Pi, or restart it.
+
+## Default lists
+
+Until the list files exist, these defaults apply:
+
+| Files and directories | CLI tools |
+|---|---|
+| `**/auth.json` | `pass` |
+| `**/mcp-auth.json` | `gpg` |
+| `**/trust.json` | `gpg2` |
+| `**/.password-store` | `gpgconf` |
+| `**/.gnupg` | `pinentry*` |
+| `**/.pi/agent` | |
+| `**/.env` | |
+| `**/.env.*` | |
+
+The defaults are only seed values. The first `add`, `remove`, or `clear` writes the list to disk, and the file is then the only source. Once `clear` empties a list, nothing in that list is restricted.
+
+## Commands
+
+```
+/securepi                                  show both lists
+/securepi list                             show both lists
+/securepi files list
+/securepi files add <path or pattern...>
+/securepi files remove <entry...>
+/securepi files clear
+/securepi cli list
+/securepi cli add <name...>
+/securepi cli remove <name...>
+/securepi cli clear
+```
+
+- Every `add`, `remove`, and `clear` asks for approval first. Changes are only saved if you confirm.
+- `add` takes several arguments and shows one approval dialog for all of them. If any argument is invalid, nothing is added.
+- Quote paths that contain spaces: `/securepi files add "~/My Docs/*.key"`.
+- Entries that are already listed are skipped. Removing an entry that isn't listed does nothing.
+- Commands are for you, not the model. The model can't change the lists, because the list file is under `~/.pi/agent`, which is itself restricted.
+
+Examples:
+
+```
+/securepi files add ~/.ssh ~/.aws ~/.kube
+/securepi files add ~/clients/*.json
+/securepi files add "**/*.pem"
+/securepi cli add mytool
+/securepi files remove ~/.kube
+/securepi files clear
+```
+
+## Matching rules
+
+### Files and directories
+
+- Entries are absolute paths, or patterns starting with `**`. Relative paths are resolved against the current directory when you add them, and `~` is expanded.
+- `*` matches within one directory level. `**/` matches any number of directories, `**` matches anything, `?` matches one character, and `[abc]` matches a character class.
+- A matching directory covers everything beneath it. `~/.ssh` covers `~/.ssh/id_ed25519`.
+- `**/auth.json` matches `auth.json` in any directory.
+- Overly broad patterns are refused: `/`, `**`, `**/*`, and similar.
+
+### CLI tools
+
+- Each command in a pipeline or chain is checked, including commands after `&&`, `||`, `;`, `|`, and inside `$( )`.
+- The program is matched by name, so `pass` matches `/usr/bin/pass` as well as `pass`. Leading `VAR=value` assignments and wrappers like `sudo`, `env`, and `nohup` are skipped.
+- An entry with a `/` is matched against the full path instead of the name.
+- Names are glob patterns too: `pinentry*` matches `pinentry-mac`.
+- Text that is only an argument does not count. `echo pass` is not a `pass` call.
+
+### Bash paths
+
+- Each argument is resolved against the current directory and checked against the file list. `--file=path` is checked too.
+- Arguments with `*`, `?`, or `[` are expanded against the filesystem before checking, so `cat ~/work/*.json` is checked against the real matching files.
+
+## Approval behavior
+
+- A match shows a dialog with the file or program, the full command for bash, and the list entry that matched. Choose **Yes** or **No**.
+- Writes and edits to a matching file only offer **No**.
+- Without an interactive UI (print or RPC mode), matches are blocked.
+
+## Storage
+
+| File | Contents |
+|---|---|
+| `~/.pi/agent/securepi-blacklist.json` | Files and directories list (JSON array of strings) |
+| `~/.pi/agent/securepi-cli.json` | CLI tools list (JSON array of strings) |
+
+If a list file exists but can't be parsed, the defaults apply until the next `add`, `remove`, or `clear`, and the dialog warns that saving will replace the file.
 
 ## Limits
 
 This is a **speed bump, not a security boundary**:
 
-- Obfuscated commands (`python -c`, `base64`, variable indirection) can bypass pattern matching.
-- Extensions and processes running as your user can read these files directly.
+- Shell variables, `eval`, subshells that build paths, and encoded commands (`base64`, `python -c`) are not resolved. A command can hide what it touches.
+- Bash path checks use only what appears in the command text. Files reached through symlinks, or paths built at runtime, are not detected.
+- Wildcard expansion uses Node's `fs.globSync`. On runtimes without it, wildcard tokens are only matched as literal text.
+- Any extension or process running as your user can read these files directly.
 - For real isolation, run Pi in a sandbox that does not contain the credentials (see Pi's `docs/containerization.md`).
 
-## Install
+## Development
 
-Symlink into Pi's global extensions directory:
-
-```bash
-pi install git:github.com/kovaxs/secure-pi
-```
-
-Then run `/reload` in Pi, or restart it.
-
-## Customize
-
-For built-in patterns, edit the `SENSITIVE_COMMANDS` and `SENSITIVE_PATHS` arrays in `securepi.ts`. For per-machine paths, use `/securepi add` instead.
+Test the logic with a temporary `HOME`, so your real `~/.pi/agent` is untouched. Bundle `securepi.ts` with esbuild and drive it through a fake `ExtensionAPI` that records the `tool_call` handler and the `securepi` command.
