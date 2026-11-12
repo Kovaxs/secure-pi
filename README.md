@@ -9,6 +9,17 @@ It gates:
 
 Writes and edits to these paths are always refused. Other matches show a Yes/No prompt. Without interactive UI (print/RPC mode), matches are blocked.
 
+## Custom blacklist
+
+Add your own paths with the `/securepi` command:
+
+```
+/securepi add ~/clients/acme      # asks for approval before adding
+/securepi list                    # show the blacklist
+```
+
+Entries are stored as absolute paths in `~/.pi/agent/securepi-blacklist.json`. Any tool access to a listed path (or anything under it) prompts for confirmation, and writes or edits are refused, just like the built-in credential paths. The model cannot change the list: the file lives under `~/.pi/agent`, which is itself gated.
+
 ## Limits
 
 This is a **speed bump, not a security boundary**:
@@ -29,4 +40,4 @@ Then run `/reload` in Pi, or restart it.
 
 ## Customize
 
-Edit the `SENSITIVE_COMMANDS` and `SENSITIVE_PATHS` arrays in `securepi.ts`.
+For built-in patterns, edit the `SENSITIVE_COMMANDS` and `SENSITIVE_PATHS` arrays in `securepi.ts`. For per-machine paths, use `/securepi add` instead.
