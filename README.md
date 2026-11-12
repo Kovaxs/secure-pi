@@ -20,7 +20,8 @@ Then run `/reload` in Pi, or restart it.
 
 ## Default lists
 
-Until the list files exist, these defaults apply:
+The default lists ship as JSON in `defaults/` next to `securepi.ts`:
+`defaults/securepi-files.json` and `defaults/securepi-cli.json`. The table shows their contents.
 
 | Files and directories | CLI tools |
 |---|---|
@@ -35,7 +36,7 @@ Until the list files exist, these defaults apply:
 | `**/securepi-blacklist.json` | |
 | `**/securepi-cli.json` | |
 
-The defaults are only seed values. The first `add`, `remove`, or `clear` writes the list to disk, and the file is then the only source. Once `clear` empties a list, nothing in that list is restricted.
+The first time a list is used, it is copied from its default file into `~/.pi/agent`. After that, the list file is the only source: edit it with `/securepi`. Once `clear` empties a list, nothing in that list is restricted. Changes to the shipped defaults only reach lists that have not been created yet.
 
 ## Commands
 
@@ -112,7 +113,7 @@ Examples:
 | `~/.pi/agent/securepi-blacklist.json` | Files and directories list (JSON array of strings) |
 | `~/.pi/agent/securepi-cli.json` | CLI tools list (JSON array of strings) |
 
-If a list file exists but can't be parsed, the defaults apply until the next `add`, `remove`, or `clear`, and the dialog warns that saving will replace the file.
+If a list file can't be parsed, the shipped default applies, so protection stays on. The list view and the next `add`, `remove`, or `clear` warn that the file is unreadable, and saving replaces it. If the shipped default itself is missing or invalid, tool calls are blocked until it is restored.
 
 ## Limits
 
@@ -129,4 +130,6 @@ This is a **speed bump, not a security boundary**:
 
 ## Development
 
-Test the logic with a temporary `HOME`, so your real `~/.pi/agent` is untouched. Bundle `securepi.ts` with esbuild and drive it through a fake `ExtensionAPI` that records the `tool_call` handler and the `securepi` command.
+Run the tests with `test/run.sh`. It builds `securepi.ts` with esbuild and runs `test/securepi.test.mjs` twice: once loaded directly, once through a symlink. Both runs use a temporary `HOME`, so your real `~/.pi/agent` is untouched. The tests drive the extension through a fake `ExtensionAPI` that records the `tool_call` handler and the `securepi` command.
+
+Timing: `node test/bench.mjs <baseline.mjs> <current.mjs>` reports the median cost per tool call for two builds.
