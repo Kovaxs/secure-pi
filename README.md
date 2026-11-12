@@ -29,9 +29,11 @@ Until the list files exist, these defaults apply:
 | `**/trust.json` | `gpg2` |
 | `**/.password-store` | `gpgconf` |
 | `**/.gnupg` | `pinentry*` |
-| `**/.pi/agent` | |
+| `**/models.json` | |
 | `**/.env` | |
 | `**/.env.*` | |
+| `**/securepi-blacklist.json` | |
+| `**/securepi-cli.json` | |
 
 The defaults are only seed values. The first `add`, `remove`, or `clear` writes the list to disk, and the file is then the only source. Once `clear` empties a list, nothing in that list is restricted.
 
@@ -54,7 +56,7 @@ The defaults are only seed values. The first `add`, `remove`, or `clear` writes 
 - `add` takes several arguments and shows one approval dialog for all of them. If any argument is invalid, nothing is added.
 - Quote paths that contain spaces: `/securepi files add "~/My Docs/*.key"`.
 - Entries that are already listed are skipped. Removing an entry that isn't listed does nothing.
-- Commands are for you, not the model. The model can't change the lists, because the list file is under `~/.pi/agent`, which is itself restricted.
+- Commands are for you, not the model. The model can't change the lists, because the two list files are in the default files list. Reading them also asks for approval, since the gate can't reliably tell reads from writes in bash.
 
 Examples:
 

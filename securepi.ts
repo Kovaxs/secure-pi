@@ -26,9 +26,11 @@ const DEFAULT_FILES = [
 	"**/trust.json",
 	"**/.password-store",
 	"**/.gnupg",
-	"**/.pi/agent",
+	"**/models.json",
 	"**/.env",
 	"**/.env.*",
+	"**/securepi-blacklist.json",
+	"**/securepi-cli.json",
 ];
 const DEFAULT_CLI = ["pass", "gpg", "gpg2", "gpgconf", "pinentry*"];
 
